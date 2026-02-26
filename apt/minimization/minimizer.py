@@ -15,6 +15,7 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.model_selection import train_test_split
 
+from apt.minimization.dp_mechanism import DifferentialPrivacyMechanism # Feature - Differential Privacy
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
@@ -76,6 +77,13 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                                        False indicates that the `generalizations` structure should be used.
                                        Default is True.
     :type generalize_using_transform: boolean, optional
+    :param epsilon: Optional differential privacy budget. If provided, Laplace noise is injected into surrogate tree
+                    split thresholds after fitting and before generalization is derived.
+    :type epsilon: float, optional
+    :param delta: Differential privacy delta parameter. Defaults to 0.0 for pure epsilon-DP.
+    :type delta: float, optional
+    :param dp_random_state: Optional random seed used by DP mechanisms.
+    :type dp_random_state: int, optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -87,7 +95,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  feature_slices: Optional[list] = None,
                  train_only_features_to_minimize: Optional[bool] = True,
                  is_regression: Optional[bool] = False,
-                 generalize_using_transform: bool = True):
+                 generalize_using_transform: bool = True,
+                 epsilon: Optional[float] = None,
+                 delta: float = 0.0,
+                 dp_random_state: Optional[int] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -113,6 +124,16 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.is_regression = is_regression
         self.encoder = encoder
         self.generalize_using_transform = generalize_using_transform
+        self.epsilon = epsilon
+        self.delta = delta
+        self.dp_random_state = dp_random_state
+        self._dp_mechanism = None
+        if self.epsilon is not None:
+            self._dp_mechanism = DifferentialPrivacyMechanism(
+                epsilon=self.epsilon,
+                delta=self.delta,
+                random_state=self.dp_random_state
+            )
         self._ncp_scores = NCPScores()
         self._feature_data = None
         self._categorical_values = {}
@@ -140,6 +161,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ret['is_regression'] = self.is_regression
         ret['estimator'] = self.estimator
         ret['encoder'] = self.encoder
+        ret['epsilon'] = self.epsilon
+        ret['delta'] = self.delta
+        ret['dp_random_state'] = self.dp_random_state
         if deep:
             ret['cells'] = copy.deepcopy(self.cells)
         else:
@@ -178,6 +202,19 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self.estimator = params['estimator']
         if 'encoder' in params:
             self.encoder = params['encoder']
+        if 'epsilon' in params:
+            self.epsilon = params['epsilon']
+        if 'delta' in params:
+            self.delta = params['delta']
+        if 'dp_random_state' in params:
+            self.dp_random_state = params['dp_random_state']
+        self._dp_mechanism = None
+        if self.epsilon is not None:
+            self._dp_mechanism = DifferentialPrivacyMechanism(
+                epsilon=self.epsilon,
+                delta=self.delta,
+                random_state=self.dp_random_state
+            )
         return self
 
     @property
@@ -266,6 +303,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self._features = [str(i) for i in range(self._n_features)]
         else:
             self._features = None
+        self._removed_count = 0 # tracks features removed from generalization constraints
 
         # Going to fit
         # (currently not dealing with option to fit with only X and y and no estimator)
@@ -327,6 +365,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self._encode_categorical_features(used_data, save_mapping=True)
             x_prepared = self._encode_categorical_features(used_x_train)
             self._dt.fit(x_prepared, y_train)
+
+            # Call privatize thresholds if diff priv is enabled
+            if self._dp_mechanism:
+                print('Differential Privacy is enabled')
+                print("Epsilon: ", self.epsilon)
+                print("Delta: ", self.delta)
+                self._privatize_tree_thresholds(x_prepared)
+
             x_prepared_test = self._encode_categorical_features(used_x_test)
 
             self._calculate_cells()
@@ -393,8 +439,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
                     print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
+                    self._removed_count += 1
 
-            # self._cells currently holds the chosen generalization based on target accuracy
 
             # calculate iLoss
             x_test_dataset = ArrayDataset(x_test, features_names=self._features)
@@ -411,8 +457,73 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             elif dataset.get_labels() is None:
                 print('No labels provided')
 
+        print("[DP] epsilon = ", self.epsilon, " and features_removed = ", self._removed_count)
         # Return the transformer
         return self
+    
+    def _privatize_tree_thresholds(self, x_prepared: pd.DataFrame):
+        """
+        apply differential privacy to split thresholds of the surrogate tree in place.
+
+        Laplace noise with truncation provides a formal DP mechanism for threshold release
+        while keeping thresholds inside valid bounds. This reduces leakage risk and
+        complements NCP-based empirical privacy.
+        """
+        thresholds = self._dt.tree_.threshold
+        features = self._dt.tree_.feature
+        cols = list(x_prepared.columns)
+        #print(thresholds, features)
+
+        one_hot = getattr(self, "_one_hot_vector_features_to_features", None)
+        external_one_hot = getattr(self, "all_one_hot_features", None)
+
+        for node_index, threshold in enumerate(thresholds):
+            # skip leaf nodes as they dont have thresholds or splits
+            if features[node_index] == -2:
+                continue
+            feature_name = cols[features[node_index]] # get feature name used in split
+
+            # skip one-hot columns generated in the minimizer encoding or externally supplied one hot cols
+            if (one_hot and feature_name in one_hot) or (external_one_hot and feature_name in external_one_hot):
+                continue
+
+            feature_data = self._feature_data.get(feature_name)
+            if not feature_data or 'min' not in feature_data or 'max' not in feature_data:
+                continue
+
+            lower = float(feature_data['min'])
+            upper = float(feature_data['max'])
+            if upper <= lower:
+                continue
+            feature_range = float(feature_data['range'])
+
+            # skip one-hot/binary-like splits
+            col_vals = x_prepared[feature_name].to_numpy()
+            if feature_range <= 1.0 and np.all((col_vals == 0) | (col_vals == 1)):
+                continue
+
+            # as feature ranges can be large, we multiply with 0.1
+            sensitivity = max(0.1 * feature_range, 1e-6)
+            shrink = max(feature_range * 1e-12, 1e-12)
+            
+            # we slightly shrink the boundaries to avoid noise being pushed exactly to boundary
+            truncated_lower = lower + shrink
+            truncated_upper = upper - shrink
+
+            if truncated_lower >= truncated_upper:
+                truncated_lower = lower
+                truncated_upper = upper
+
+            privatized_threshold = self._dp_mechanism.privatize_value(
+                threshold,
+                lower=truncated_lower,
+                upper=truncated_upper,
+                sensitivity=sensitivity
+            )
+            # set threshold to new privatized value
+            thresholds[node_index] = privatized_threshold
+            print('[DP] node=%d feature=%s orig=%.6f noisy=%.6f' %
+                  (node_index, feature_name, threshold, privatized_threshold))
 
     def transform(self, X: Optional[DATA_PANDAS_NUMPY_TYPE] = None, features_names: Optional[list] = None,
                   dataset: Optional[ArrayDataset] = None):
@@ -869,24 +980,85 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 match_samples = sample_rows.iloc[indexes]
                 match_rows = original_rows.iloc[indexes]
 
-            # find the "middle" of the cluster
-            array = match_samples.values
-            # Only works with numpy 1.9.0 and higher!!!
-            median = np.median(array, axis=0)
-            i = 0
-            min = len(array)
-            min_dist = float("inf")
-            for row in array:
-                dist = distance.euclidean(row, median)
-                if dist < min_dist:
-                    min_dist = dist
-                    min = i
-                i = i + 1
-            # since this is an actual row from the data, correct one-hot encoding is already guaranteed
-            row = match_rows.iloc[min]
-            for feature in cell['ranges'].keys():
+            row = None
+            if match_rows.empty or match_samples.empty: # If either of the lists are empty, DP has created an empty cell
+                print("[DP-SAFEGUARD] Empty cell encountered for cell_id:", cell.get("id", "unknown"))
+                relaxed_rows = original_train_features
+
+                # expand feature range bounds by 1% to recover a representative when an empty region is created by DP.
+                for feature, bounds in cell['ranges'].items():
+
+                    if feature not in relaxed_rows.columns:
+                        continue
+
+                    start = bounds.get('start')
+                    end = bounds.get('end')
+                    feature_range = self._feature_data.get(feature, {}).get('range')
+
+                    if feature_range and feature_range > 0:
+                        pad = 0.01 * feature_range
+                    else:
+                        pad = 0.0
+
+                    if start is not None:
+                        relaxed_rows = relaxed_rows[relaxed_rows[feature] > (start - pad)]
+                    if end is not None:
+                        relaxed_rows = relaxed_rows[relaxed_rows[feature] <= (end + pad)]
+
+                if not relaxed_rows.empty:
+                    match_rows = relaxed_rows
+                    match_samples = prepared_data.loc[match_rows.index]
+
+                else:
+                    print('[DP-SAFEGUARD] Relaxation failed; selecting nearest representative row.')
+                    midpoints = {}
+                    for feature, bounds in cell['ranges'].items():
+                        if feature not in original_train_features.columns:
+                            continue
+                        start = bounds.get('start')
+                        end = bounds.get('end')
+                        if start is not None and end is not None:
+                            midpoints[feature] = 0.5 * (start + end)
+
+                    if midpoints:
+                        used_features = list(midpoints.keys())
+                        diffs = original_train_features[used_features].to_numpy(dtype=float) - \
+                            np.array([midpoints[feature] for feature in used_features], dtype=float)
+                        distances = np.sum(diffs * diffs, axis=1)
+                        row = original_train_features.iloc[int(np.argmin(distances))]
+
+                    elif not original_rows.empty:
+                        row = original_rows.iloc[0]
+                    else:
+                        row = original_train_features.iloc[0]
+
+            # Normal case - choose a central representative row
+
+            if row is None:
+                if match_rows.empty:
+                    print("[DP-SAFEGUARD] No matching rows; falling back to first training row.")
+                    row = original_train_features.iloc[0]
+                elif match_samples.empty:
+                    print("[DP-SAFEGUARD] match_samples empty; selecting from match_rows.")
+                    row = match_rows.iloc[0]
+                else:
+                    arr = match_samples.to_numpy()
+                    median = np.median(arr, axis=0)
+
+                    best_idx = 0
+                    best_dist = float("inf")
+                    for i, sample in enumerate(arr):
+                        d = distance.euclidean(sample, median)
+                        if d < best_dist:
+                            best_dist = d
+                            best_idx = i
+                    # keep index safe
+                    best_idx = max(0, min(best_idx, len(match_rows) - 1))
+                    row = match_rows.iloc[best_idx]
+                # --- END SAFEGUARD ---
+            for feature in cell['ranges']:
                 cell['representative'][feature] = row[feature]
-            for feature in cell['categories'].keys():
+            for feature in cell['categories']:
                 cell['representative'][feature] = row[feature]
 
     def _find_sample_nodes(self, samples, nodes):
