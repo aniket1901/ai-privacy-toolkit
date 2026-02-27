@@ -16,6 +16,8 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.model_selection import train_test_split
 
 from apt.minimization.dp_mechanism import DifferentialPrivacyMechanism # Feature - Differential Privacy
+from apt.minimization.privacy_floor import PrivacyFloorEnforcer # Feature - Ensure Minimum Privacy Level
+
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
     CLASSIFIER_SINGLE_OUTPUT_CLASS_PROBABILITIES
@@ -84,6 +86,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     :type delta: float, optional
     :param dp_random_state: Optional random seed used by DP mechanisms.
     :type dp_random_state: int, optional
+    :param min_ncp: Optional minimum NCP floor for generalized output.
+    :type min_ncp: float, optional
+    :param privacy_enforcement: NCP floor mode. Options are "auto" (increase generalization & privacy) and "raise" (raise an Error)
+    :type privacy_enforcement: str, optional
+    :param privacy_floor_alpha: Optional relative floor factor. Effective floor is alpha * baseline NCP when min_ncp is not provided.
+    :type privacy_floor_alpha: float, optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -98,7 +106,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  generalize_using_transform: bool = True,
                  epsilon: Optional[float] = None,
                  delta: float = 0.0,
-                 dp_random_state: Optional[int] = None):
+                 dp_random_state: Optional[int] = None,
+                 min_ncp: Optional[float] = None,
+                 privacy_enforcement: str = "auto",
+                 privacy_floor_alpha: Optional[float] = None):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -127,6 +138,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.epsilon = epsilon
         self.delta = delta
         self.dp_random_state = dp_random_state
+        self.min_ncp = min_ncp
+        self.privacy_enforcement = privacy_enforcement
+        self.privacy_floor_alpha = privacy_floor_alpha
+        self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
             self._dp_mechanism = DifferentialPrivacyMechanism(
@@ -134,6 +149,11 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 delta=self.delta,
                 random_state=self.dp_random_state
             )
+        self._privacy_floor_enforcer = PrivacyFloorEnforcer(
+            min_ncp=self.min_ncp,
+            enforcement=self.privacy_enforcement,
+            alpha=self.privacy_floor_alpha
+        )
         self._ncp_scores = NCPScores()
         self._feature_data = None
         self._categorical_values = {}
@@ -164,6 +184,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ret['epsilon'] = self.epsilon
         ret['delta'] = self.delta
         ret['dp_random_state'] = self.dp_random_state
+        ret['min_ncp'] = self.min_ncp
+        ret['privacy_enforcement'] = self.privacy_enforcement
+        ret['privacy_floor_alpha'] = self.privacy_floor_alpha
         if deep:
             ret['cells'] = copy.deepcopy(self.cells)
         else:
@@ -208,6 +231,13 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self.delta = params['delta']
         if 'dp_random_state' in params:
             self.dp_random_state = params['dp_random_state']
+        if 'min_ncp' in params:
+            self.min_ncp = params['min_ncp']
+        if 'privacy_enforcement' in params:
+            self.privacy_enforcement = params['privacy_enforcement']
+        if 'privacy_floor_alpha' in params:
+            self.privacy_floor_alpha = params['privacy_floor_alpha']
+        self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
             self._dp_mechanism = DifferentialPrivacyMechanism(
@@ -215,6 +245,11 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 delta=self.delta,
                 random_state=self.dp_random_state
             )
+        self._privacy_floor_enforcer = PrivacyFloorEnforcer(
+            min_ncp=self.min_ncp,
+            enforcement=self.privacy_enforcement,
+            alpha=self.privacy_floor_alpha
+        )
         return self
 
     @property
@@ -281,6 +316,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         :type dataset: `ArrayDataset`, optional
         :return: self
         """
+        self._baseline_ncp = None
 
         # take into account that estimator, X, y, cells, features may be None
         if X is not None and y is not None:
@@ -392,43 +428,82 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
             print('Initial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
+            privacy_floor_enabled = self._privacy_floor_enforcer.is_enabled()
+            initial_floor_violated = False
+            ncp_value = 0.0
+
+            if privacy_floor_enabled:
+                self._baseline_ncp = self._compute_privacy_ncp(generalized)
+                self._privacy_floor_enforcer.set_baseline(self._baseline_ncp)
+                effective_min_ncp = self._privacy_floor_enforcer.get_effective_min_ncp()
+
+                print("[PRIVACY-FLOOR] baseline and initial NCP = ", self._baseline_ncp)
+                
+                ncp_value = self._baseline_ncp
+                if not self._privacy_floor_enforcer.check(ncp_value):
+                    self._privacy_floor_enforcer.on_violation(ncp_value)
+                    initial_floor_violated = True
+
+                if self.privacy_floor_alpha is not None:
+                    print("alpha = ", self.privacy_floor_alpha, "effective min_ncp = ", effective_min_ncp)
+                    if self.min_ncp is not None:
+                        print(" (absolute min_ncp takes precedence)")
+                else:
+                    print("Min NCP is ", effective_min_ncp)
 
             # if accuracy above threshold, improve generalization
             if accuracy > self.target_accuracy:
                 print('Improving generalizations')
-                self._level = 0
-                while accuracy > self.target_accuracy:
+                #self._level = 0
+                best_state = self._snapshot_state(accuracy, ncp_value)
+                while accuracy > self.target_accuracy or (
+                    privacy_floor_enabled and accuracy >= self.target_accuracy and not self._privacy_floor_enforcer.check(ncp_value)
+                ):
                     self._level += 1
-                    cells_previous_iter = self.cells
-                    generalization_prev_iter = self._generalizations
-                    cells_by_id_prev = self._cells_by_id
                     nodes = self._get_nodes_level(self._level)
 
                     try:
                         self._calculate_level_cells(self._level)
                     except TypeError as e:
                         print(e)
-                        self._level -= 1
+                        self._restore_state(best_state)
                         break
 
                     self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
 
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-                    # if accuracy passed threshold roll back to previous iteration generalizations
+                    if privacy_floor_enabled:
+                        ncp_value = self._compute_privacy_ncp(generalized)
+                        print("[PRIVACY-FLOOR] level=", self._level, " accuracy=", accuracy, " NCP=", ncp_value)
+                        if not self._privacy_floor_enforcer.check(ncp_value):
+                            self._privacy_floor_enforcer.on_violation(ncp_value)
+
                     if accuracy < self.target_accuracy:
-                        self.cells = cells_previous_iter
-                        self._generalizations = generalization_prev_iter
-                        self._cells_by_id = cells_by_id_prev
-                        self._level -= 1
+                        self._restore_state(best_state)
                         break
                     else:
                         print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
+                        if privacy_floor_enabled:
+                            if ncp_value >= best_state['ncp']:
+                                best_state = self._snapshot_state(accuracy, ncp_value)
+                        else:
+                            best_state = self._snapshot_state(accuracy, ncp_value)
 
             # if accuracy below threshold, improve accuracy by removing features from generalization
             elif accuracy < self.target_accuracy:
                 print('Improving accuracy')
-                while accuracy < self.target_accuracy:
+                best_safe = None
+                stop_accuracy_improvement = False
+
+                if privacy_floor_enabled:
+                    if not initial_floor_violated:
+                        best_safe = self._snapshot_state(accuracy, ncp_value)
+                    else:
+                        print("[PRIVACY-FLOOR] initial state below min_ncp, stopping accuracy improvement")
+                        stop_accuracy_improvement = True
+
+                while accuracy < self.target_accuracy and not stop_accuracy_improvement:
                     removed_feature = self._remove_feature_from_generalization(x_test, x_prepared_test,
                                                                                nodes, y_test,
                                                                                self._feature_data, accuracy,
@@ -438,14 +513,32 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
                     generalized = self._generalize(x_test, x_prepared_test, nodes)
                     accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-                    print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
                     self._removed_count += 1
+                    print('Removed feature: %s, new relative accuracy: %f' % (removed_feature, accuracy))
+
+                    if privacy_floor_enabled:
+                        ncp_value = self._compute_privacy_ncp(generalized)
+                        print("[PRIVACY-FLOOR] removed_count = ", self._removed_count, " accuracy = ", accuracy, " NCP = ", ncp_value)
+
+                        if self._privacy_floor_enforcer.check(ncp_value):
+                            best_safe = self._snapshot_state(accuracy, ncp_value)
+                        else:
+                            self._privacy_floor_enforcer.on_violation(ncp_value)
+                            print("[PRIVACY-FLOOR] violated, rolling back to last safe state with NCP = ", best_safe['ncp'])
+                            self._restore_state(best_safe)
+                            nodes = self._get_nodes_level(self._level)
+                            generalized = self._generalize(x_test, x_prepared_test, nodes)
+                            accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+                            break
 
 
             # calculate iLoss
-            x_test_dataset = ArrayDataset(x_test, features_names=self._features)
-            self._ncp_scores.fit_score = self.calculate_ncp(x_test_dataset)
-            self._ncp_scores.generalizations_score = self.calculate_ncp(x_test_dataset)
+            final_nodes = self._get_nodes_level(self._level)
+            final_generalized = self._generalize(x_test, x_prepared_test, final_nodes)
+            final_generalized_dataset = ArrayDataset(final_generalized, features_names=self._features)
+            final_ncp = self.calculate_ncp(final_generalized_dataset)
+            self._ncp_scores.fit_score = final_ncp
+            self._ncp_scores.generalizations_score = final_ncp
         else:
             print('No fitting was performed as some information was missing')
             if not self.estimator:
@@ -460,6 +553,29 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         print("[DP] epsilon = ", self.epsilon, " and features_removed = ", self._removed_count)
         # Return the transformer
         return self
+
+    # Helper functions to enforce min ncp
+    def _snapshot_state(self, accuracy, ncp_value):
+        return {
+            "cells": copy.deepcopy(self.cells),
+            "generalizations": copy.deepcopy(self._generalizations),
+            "cells_by_id": copy.deepcopy(self._cells_by_id),
+            "level": self._level,
+            "removed_count": self._removed_count,
+            "accuracy": accuracy,
+            "ncp": ncp_value,
+        }
+
+    def _restore_state(self, state):
+        self.cells = state["cells"]
+        self._generalizations = state["generalizations"]
+        self._cells_by_id = state["cells_by_id"]
+        self._level = state["level"]
+        self._removed_count = state["removed_count"]
+
+    def _compute_privacy_ncp(self, generalized):
+        generalized_dataset = ArrayDataset(generalized, features_names=self._features)
+        return self.calculate_ncp(generalized_dataset)
     
     def _privatize_tree_thresholds(self, x_prepared: pd.DataFrame):
         """
@@ -1239,7 +1355,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     range_min = feature_ncp
                     remove_feature = feature
 
-        print('feature to remove: ' + (str(remove_feature) if remove_feature is not None else 'none'))
+        print('\nfeature to remove: ' + (str(remove_feature) if remove_feature is not None else 'none'))
         return remove_feature
 
     def _calculate_ncp_for_feature_from_cells(self, feature, feature_data, samples_pd):
