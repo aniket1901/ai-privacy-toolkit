@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 
 from apt.minimization.dp_mechanism import DifferentialPrivacyMechanism # Feature - Differential Privacy
 from apt.minimization.privacy_floor import PrivacyFloorEnforcer # Feature - Ensure Minimum Privacy Level
+from apt.minimization.homogeneity_guard import HomogeneityGuard # Feature - HomogeneityGuard to safeguard against homogeneity attacks
 
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
@@ -92,6 +93,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     :type privacy_enforcement: str, optional
     :param privacy_floor_alpha: Optional relative floor factor. Effective floor is alpha * baseline NCP when min_ncp is not provided.
     :type privacy_floor_alpha: float, optional
+    :param homogeneity_min_cell_size: Minimum number of records required in each cell.
+    :type homogeneity_min_cell_size: int, optional
+    :param homogeneity_min_label_diversity: Minimum distinct sensitive labels required per cell.
+    :type homogeneity_min_label_diversity: int, optional
+    :param homogeneity_min_entropy: Optional minimum entropy threshold for sensitive labels per cell.
+    :type homogeneity_min_entropy: float, optional
+    :param homogeneity_enforcement: Homogeneity enforcement mode: "auto", "raise", or "warn".
+    :type homogeneity_enforcement: str, optional
+    :param max_homogeneity_prune_level: Maximum prune level to try when auto-enforcing homogeneity.
+    :type max_homogeneity_prune_level: int, optional
+    :param homogeneity_accuracy_tolerance: Allowed temporary drop below target_accuracy during homogeneity auto-enforcement.
+    :type homogeneity_accuracy_tolerance: float, optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -109,7 +122,13 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  dp_random_state: Optional[int] = None,
                  min_ncp: Optional[float] = None,
                  privacy_enforcement: str = "auto",
-                 privacy_floor_alpha: Optional[float] = None):
+                 privacy_floor_alpha: Optional[float] = None,
+                 homogeneity_min_cell_size: int = 1,
+                 homogeneity_min_label_diversity: int = 1,
+                 homogeneity_min_entropy: Optional[float] = None,
+                 homogeneity_enforcement: str = "auto",
+                 max_homogeneity_prune_level: int = 10,
+                 homogeneity_accuracy_tolerance: float = 0.05):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -141,6 +160,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.min_ncp = min_ncp
         self.privacy_enforcement = privacy_enforcement
         self.privacy_floor_alpha = privacy_floor_alpha
+        self.homogeneity_min_cell_size = homogeneity_min_cell_size
+        self.homogeneity_min_label_diversity = homogeneity_min_label_diversity
+        self.homogeneity_min_entropy = homogeneity_min_entropy
+        self.homogeneity_enforcement = homogeneity_enforcement
+        self.max_homogeneity_prune_level = max_homogeneity_prune_level
+        self.homogeneity_accuracy_tolerance = homogeneity_accuracy_tolerance
         self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
@@ -149,11 +174,21 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 delta=self.delta,
                 random_state=self.dp_random_state
             )
-        self._privacy_floor_enforcer = PrivacyFloorEnforcer(
-            min_ncp=self.min_ncp,
-            enforcement=self.privacy_enforcement,
-            alpha=self.privacy_floor_alpha
-        )
+        self._privacy_floor_enforcer = None
+        if self.min_ncp is not None or self.privacy_floor_alpha is not None:
+            self._privacy_floor_enforcer = PrivacyFloorEnforcer(
+                min_ncp=self.min_ncp,
+                enforcement=self.privacy_enforcement,
+                alpha=self.privacy_floor_alpha
+            )
+        self._homogeneity_guard = None
+        if self.homogeneity_min_cell_size > 1 or self.homogeneity_min_label_diversity > 1 or self.homogeneity_min_entropy is not None:
+            self._homogeneity_guard = HomogeneityGuard(
+                min_cell_size=self.homogeneity_min_cell_size,
+                min_label_diversity=self.homogeneity_min_label_diversity,
+                min_entropy=self.homogeneity_min_entropy,
+                enforcement=self.homogeneity_enforcement
+            )
         self._ncp_scores = NCPScores()
         self._feature_data = None
         self._categorical_values = {}
@@ -187,6 +222,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ret['min_ncp'] = self.min_ncp
         ret['privacy_enforcement'] = self.privacy_enforcement
         ret['privacy_floor_alpha'] = self.privacy_floor_alpha
+        ret['homogeneity_min_cell_size'] = self.homogeneity_min_cell_size
+        ret['homogeneity_min_label_diversity'] = self.homogeneity_min_label_diversity
+        ret['homogeneity_min_entropy'] = self.homogeneity_min_entropy
+        ret['homogeneity_enforcement'] = self.homogeneity_enforcement
+        ret['max_homogeneity_prune_level'] = self.max_homogeneity_prune_level
+        ret['homogeneity_accuracy_tolerance'] = self.homogeneity_accuracy_tolerance
         if deep:
             ret['cells'] = copy.deepcopy(self.cells)
         else:
@@ -237,6 +278,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self.privacy_enforcement = params['privacy_enforcement']
         if 'privacy_floor_alpha' in params:
             self.privacy_floor_alpha = params['privacy_floor_alpha']
+        if 'homogeneity_min_cell_size' in params:
+            self.homogeneity_min_cell_size = params['homogeneity_min_cell_size']
+        if 'homogeneity_min_label_diversity' in params:
+            self.homogeneity_min_label_diversity = params['homogeneity_min_label_diversity']
+        if 'homogeneity_min_entropy' in params:
+            self.homogeneity_min_entropy = params['homogeneity_min_entropy']
+        if 'homogeneity_enforcement' in params:
+            self.homogeneity_enforcement = params['homogeneity_enforcement']
+        if 'max_homogeneity_prune_level' in params:
+            self.max_homogeneity_prune_level = params['max_homogeneity_prune_level']
+        if 'homogeneity_accuracy_tolerance' in params:
+            self.homogeneity_accuracy_tolerance = params['homogeneity_accuracy_tolerance']
         self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
@@ -245,11 +298,21 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 delta=self.delta,
                 random_state=self.dp_random_state
             )
-        self._privacy_floor_enforcer = PrivacyFloorEnforcer(
-            min_ncp=self.min_ncp,
-            enforcement=self.privacy_enforcement,
-            alpha=self.privacy_floor_alpha
-        )
+        self._privacy_floor_enforcer = None
+        if self.min_ncp is not None or self.privacy_floor_alpha is not None:
+            self._privacy_floor_enforcer = PrivacyFloorEnforcer(
+                min_ncp=self.min_ncp,
+                enforcement=self.privacy_enforcement,
+                alpha=self.privacy_floor_alpha
+            )
+        self._homogeneity_guard = None
+        if self.homogeneity_min_cell_size > 1 or self.homogeneity_min_label_diversity > 1 or self.homogeneity_min_entropy is not None:
+            self._homogeneity_guard = HomogeneityGuard(
+                min_cell_size=self.homogeneity_min_cell_size,
+                min_label_diversity=self.homogeneity_min_label_diversity,
+                min_entropy=self.homogeneity_min_entropy,
+                enforcement=self.homogeneity_enforcement
+            )
         return self
 
     @property
@@ -428,7 +491,25 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
             print('Initial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
-            privacy_floor_enabled = self._privacy_floor_enforcer.is_enabled()
+            
+            if self._homogeneity_guard is not None and self._homogeneity_guard.is_enabled():
+                self._enforce_homogeneity_guard(
+                    prepared_train=x_prepared,
+                    y_train=y_train,
+                    x_test=x_test,
+                    x_prepared_test=x_prepared_test,
+                    y_test=y_test,
+                    x_prepared=x_prepared,
+                    used_x_train=used_x_train
+                )
+                nodes = self._get_nodes_level(self._level)
+                generalized = self._generalize(x_test, x_prepared_test, nodes)
+                accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+
+            privacy_floor_enabled = False
+
+            if self._privacy_floor_enforcer is not None:
+                privacy_floor_enabled = self._privacy_floor_enforcer.is_enabled()
             initial_floor_violated = False
             ncp_value = 0.0
 
@@ -576,6 +657,85 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     def _compute_privacy_ncp(self, generalized):
         generalized_dataset = ArrayDataset(generalized, features_names=self._features)
         return self.calculate_ncp(generalized_dataset)
+
+    def _collect_homogeneity_violations(self, prepared_train, y_train):
+
+        level_nodes = self._get_nodes_level(self._level)
+        node_ids = self._find_sample_nodes(prepared_train, level_nodes) # List of cells that each row falls in at this level
+
+        violations = []
+        for cell in self.cells:
+            indices = [i for i, node_id in enumerate(node_ids) if node_id == cell['id']] # list of row ids that fall in this particular cell
+            stats = self._homogeneity_guard.cell_stats(y_train, indices) 
+            if not self._homogeneity_guard.check_cell(stats):
+                violations.append((cell['id'], stats))
+        return violations
+
+    def _enforce_homogeneity_guard(self, prepared_train, y_train, x_test, x_prepared_test, y_test, x_prepared,
+                                   used_x_train):
+        """
+        Enforce homogeneity constraints on cells using y_train as the sensitive attribute.
+        If enforcement is "auto", prune to higher levels to merge cells while preserving target accuracy.
+        """
+        violations = self._collect_homogeneity_violations(prepared_train, y_train)
+        print("[HOMOGENEITY-GUARD] violations=", len(violations))
+
+        for cell_id, stats in violations:
+            print("[HOMOGENEITY-GUARD] cell_id=", cell_id, " size=", stats['size'], " distinct=", stats['distinct'],
+                  " entropy=", stats['entropy'])
+
+        if not violations:
+            print("[HOMOGENEITY-GUARD] satisfied (no violations)")
+            return
+
+        enforcement = self._homogeneity_guard.enforcement
+        if enforcement == "warn" or enforcement == "raise":
+            self._homogeneity_guard.on_violation(violations[0][0], violations[0][1])
+            return
+
+        nodes = self._get_nodes_level(self._level)
+        generalized = self._generalize(x_test, x_prepared_test, nodes)
+        accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+        ncp_value = self._compute_privacy_ncp(generalized)
+        best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
+        best_violation_count = len(violations)
+        max_level = min(self.max_homogeneity_prune_level, self._dt.get_depth())
+
+        while violations and self._level < max_level:
+            self._level += 1
+            try:
+                self._calculate_level_cells(self._level)
+            except TypeError as e:
+                print(e)
+                self._restore_state(best_state)
+                print("[HOMOGENEITY-GUARD] stop: cannot prune further, rolling back")
+                return
+
+            nodes = self._get_nodes_level(self._level)
+            self._attach_cells_representatives(x_prepared, used_x_train, y_train, nodes)
+            generalized = self._generalize(x_test, x_prepared_test, nodes)
+            accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
+            
+            # We allow some tolerance (default 0.05) and accuracy can fall a bit below the target 
+            min_allowed = self.target_accuracy - self.homogeneity_accuracy_tolerance
+            if accuracy < min_allowed:
+                self._restore_state(best_state)
+                print("[HOMOGENEITY-GUARD] stop: accuracy below tolerance, rolling back")
+                return
+
+            ncp_value = self._compute_privacy_ncp(generalized)
+            violations = self._collect_homogeneity_violations(prepared_train, y_train)
+            if len(violations) < best_violation_count:
+                best_violation_count = len(violations)
+                best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
+            print("[HOMOGENEITY-GUARD] level=", self._level, " accuracy=", accuracy, " violations=", len(violations))
+        
+        if violations:
+            self._restore_state(best_state)
+            print("[HOMOGENEITY-GUARD] constraints not satisfied within prune limit")
+            return
+
+        print("[HOMOGENEITY-GUARD] satisfied")
     
     def _privatize_tree_thresholds(self, x_prepared: pd.DataFrame):
         """
