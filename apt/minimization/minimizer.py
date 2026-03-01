@@ -18,6 +18,7 @@ from sklearn.model_selection import train_test_split
 from apt.minimization.dp_mechanism import DifferentialPrivacyMechanism # Feature - Differential Privacy
 from apt.minimization.privacy_floor import PrivacyFloorEnforcer # Feature - Ensure Minimum Privacy Level
 from apt.minimization.homogeneity_guard import HomogeneityGuard # Feature - HomogeneityGuard to safeguard against homogeneity attacks
+from apt.minimization.privacy_risk_enforcer import PrivacyRiskEnforcer
 
 from apt.utils.datasets import ArrayDataset, DATA_PANDAS_NUMPY_TYPE
 from apt.utils.models import Model, SklearnRegressor, SklearnClassifier, \
@@ -105,6 +106,22 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     :type max_homogeneity_prune_level: int, optional
     :param homogeneity_accuracy_tolerance: Allowed temporary drop below target_accuracy during homogeneity auto-enforcement.
     :type homogeneity_accuracy_tolerance: float, optional
+    :param risk_max_risk: Optional upper bound on the selected membership attack risk score.
+    :type risk_max_risk: float, optional
+    :param risk_max_member_auc: Optional upper bound on member ROC AUC for membership classification attack.
+    :type risk_max_member_auc: float, optional
+    :param risk_max_non_member_auc: Optional upper bound on non-member ROC AUC for membership classification attack.
+    :type risk_max_non_member_auc: float, optional
+    :param risk_require_no_warning: Whether the risk attack must not raise its synthetic data quality warning.
+    :type risk_require_no_warning: bool, optional
+    :param risk_attack_type: Membership attack type used for risk assessment.
+    :type risk_attack_type: str, optional
+    :param risk_enforcement: Risk enforcement mode: "auto" or "raise".
+    :type risk_enforcement: str, optional
+    :param max_risk_prune_level: Maximum prune level to try for risk auto-enforcement.
+    :type max_risk_prune_level: int, optional
+    :param risk_accuracy_tolerance: Allowed temporary drop below target_accuracy during risk auto-enforcement.
+    :type risk_accuracy_tolerance: float, optional
     """
 
     def __init__(self, estimator: Union[BaseEstimator, Model] = None,
@@ -128,7 +145,15 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                  homogeneity_min_entropy: Optional[float] = None,
                  homogeneity_enforcement: str = "auto",
                  max_homogeneity_prune_level: int = 10,
-                 homogeneity_accuracy_tolerance: float = 0.05):
+                 homogeneity_accuracy_tolerance: float = 0.05,
+                 risk_max_risk: Optional[float] = None,
+                 risk_max_member_auc: Optional[float] = 0.90,
+                 risk_max_non_member_auc: Optional[float] = 0.90,
+                 risk_require_no_warning: bool = True,
+                 risk_attack_type: str = "membership_classification",
+                 risk_enforcement: str = "auto",
+                 max_risk_prune_level: int = 10,
+                 risk_accuracy_tolerance: float = 0.05):
 
         self.estimator = estimator
         if estimator is not None and not issubclass(estimator.__class__, Model):
@@ -166,6 +191,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self.homogeneity_enforcement = homogeneity_enforcement
         self.max_homogeneity_prune_level = max_homogeneity_prune_level
         self.homogeneity_accuracy_tolerance = homogeneity_accuracy_tolerance
+        self.risk_max_risk = risk_max_risk
+        self.risk_max_member_auc = risk_max_member_auc
+        self.risk_max_non_member_auc = risk_max_non_member_auc
+        self.risk_require_no_warning = risk_require_no_warning
+        self.risk_attack_type = risk_attack_type
+        self.risk_enforcement = risk_enforcement
+        self.max_risk_prune_level = max_risk_prune_level
+        self.risk_accuracy_tolerance = risk_accuracy_tolerance
         self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
@@ -188,6 +221,17 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 min_label_diversity=self.homogeneity_min_label_diversity,
                 min_entropy=self.homogeneity_min_entropy,
                 enforcement=self.homogeneity_enforcement
+            )
+        self._privacy_risk_enforcer = None
+        if self.risk_max_risk:
+            self._privacy_risk_enforcer = PrivacyRiskEnforcer(
+                attack_type=self.risk_attack_type,
+                max_risk=self.risk_max_risk,
+                max_member_auc=self.risk_max_member_auc,
+                max_non_member_auc=self.risk_max_non_member_auc,
+                require_no_warning=self.risk_require_no_warning,
+                enforcement=self.risk_enforcement,
+                max_iters=self.max_risk_prune_level
             )
         self._ncp_scores = NCPScores()
         self._feature_data = None
@@ -228,6 +272,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         ret['homogeneity_enforcement'] = self.homogeneity_enforcement
         ret['max_homogeneity_prune_level'] = self.max_homogeneity_prune_level
         ret['homogeneity_accuracy_tolerance'] = self.homogeneity_accuracy_tolerance
+        ret['risk_max_risk'] = self.risk_max_risk
+        ret['risk_max_member_auc'] = self.risk_max_member_auc
+        ret['risk_max_non_member_auc'] = self.risk_max_non_member_auc
+        ret['risk_require_no_warning'] = self.risk_require_no_warning
+        ret['risk_attack_type'] = self.risk_attack_type
+        ret['risk_enforcement'] = self.risk_enforcement
+        ret['max_risk_prune_level'] = self.max_risk_prune_level
+        ret['risk_accuracy_tolerance'] = self.risk_accuracy_tolerance
         if deep:
             ret['cells'] = copy.deepcopy(self.cells)
         else:
@@ -290,6 +342,22 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self.max_homogeneity_prune_level = params['max_homogeneity_prune_level']
         if 'homogeneity_accuracy_tolerance' in params:
             self.homogeneity_accuracy_tolerance = params['homogeneity_accuracy_tolerance']
+        if 'risk_max_risk' in params:
+            self.risk_max_risk = params['risk_max_risk']
+        if 'risk_max_member_auc' in params:
+            self.risk_max_member_auc = params['risk_max_member_auc']
+        if 'risk_max_non_member_auc' in params:
+            self.risk_max_non_member_auc = params['risk_max_non_member_auc']
+        if 'risk_require_no_warning' in params:
+            self.risk_require_no_warning = params['risk_require_no_warning']
+        if 'risk_attack_type' in params:
+            self.risk_attack_type = params['risk_attack_type']
+        if 'risk_enforcement' in params:
+            self.risk_enforcement = params['risk_enforcement']
+        if 'max_risk_prune_level' in params:
+            self.max_risk_prune_level = params['max_risk_prune_level']
+        if 'risk_accuracy_tolerance' in params:
+            self.risk_accuracy_tolerance = params['risk_accuracy_tolerance']
         self._baseline_ncp = None
         self._dp_mechanism = None
         if self.epsilon is not None:
@@ -312,6 +380,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 min_label_diversity=self.homogeneity_min_label_diversity,
                 min_entropy=self.homogeneity_min_entropy,
                 enforcement=self.homogeneity_enforcement
+            )
+        self._privacy_risk_enforcer = None
+        if self.risk_max_risk is not None or self.risk_max_member_auc is not None or \
+                self.risk_max_non_member_auc is not None or self.risk_require_no_warning:
+            self._privacy_risk_enforcer = PrivacyRiskEnforcer(
+                attack_type=self.risk_attack_type,
+                max_risk=self.risk_max_risk,
+                max_member_auc=self.risk_max_member_auc,
+                max_non_member_auc=self.risk_max_non_member_auc,
+                require_no_warning=self.risk_require_no_warning,
+                enforcement=self.risk_enforcement,
+                max_iters=self.max_risk_prune_level
             )
         return self
 
@@ -489,7 +569,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             # check accuracy
             accuracy = self._calculate_accuracy(generalized, y_test, self.estimator, self.encoder)
-            print('Initial accuracy of model on generalized data, relative to original model predictions '
+            print('\nInitial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
             
             if self._homogeneity_guard is not None and self._homogeneity_guard.is_enabled():
@@ -518,7 +598,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 self._privacy_floor_enforcer.set_baseline(self._baseline_ncp)
                 effective_min_ncp = self._privacy_floor_enforcer.get_effective_min_ncp()
 
-                print("[PRIVACY-FLOOR] baseline and initial NCP = ", self._baseline_ncp)
+                print("\n[PRIVACY-FLOOR] baseline and initial NCP = ", self._baseline_ncp)
                 
                 ncp_value = self._baseline_ncp
                 if not self._privacy_floor_enforcer.check(ncp_value):
@@ -534,7 +614,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             # if accuracy above threshold, improve generalization
             if accuracy > self.target_accuracy:
-                print('Improving generalizations')
+                print('\nImproving generalizations')
                 #self._level = 0
                 best_state = self._snapshot_state(accuracy, ncp_value)
                 while accuracy > self.target_accuracy or (
@@ -558,9 +638,12 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         ncp_value = self._compute_privacy_ncp(generalized)
                         print("[PRIVACY-FLOOR] level=", self._level, " accuracy=", accuracy, " NCP=", ncp_value)
                         if not self._privacy_floor_enforcer.check(ncp_value):
+                            print("[PRIVACY-FLOOR] violated, rolling back to last safe state with NCP = ", best_state['ncp'])
                             self._privacy_floor_enforcer.on_violation(ncp_value)
 
                     if accuracy < self.target_accuracy:
+                        print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
+                        print("Accuracy falling below target accuracy, restoring previous state")
                         self._restore_state(best_state)
                         break
                     else:
@@ -573,7 +656,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             # if accuracy below threshold, improve accuracy by removing features from generalization
             elif accuracy < self.target_accuracy:
-                print('Improving accuracy')
+                print('\nImproving accuracy')
                 best_safe = None
                 stop_accuracy_improvement = False
 
@@ -614,6 +697,19 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
 
             # calculate iLoss
+            train_dataset = ArrayDataset(x_train, features_names=self._features)
+            test_dataset = ArrayDataset(x_test, features_names=self._features)
+            self._enforce_privacy_risk(
+                train_dataset=train_dataset,
+                test_dataset=test_dataset,
+                x_train=x_train,
+                x_prepared_train=x_prepared,
+                x_test=x_test,
+                x_prepared_test=x_prepared_test,
+                y_test=y_test,
+                used_x_train=used_x_train,
+                y_train=y_train
+            )
             final_nodes = self._get_nodes_level(self._level)
             final_generalized = self._generalize(x_test, x_prepared_test, final_nodes)
             final_generalized_dataset = ArrayDataset(final_generalized, features_names=self._features)
@@ -631,7 +727,6 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             elif dataset.get_labels() is None:
                 print('No labels provided')
 
-        print("[DP] epsilon = ", self.epsilon, " and features_removed = ", self._removed_count)
         # Return the transformer
         return self
 
@@ -736,6 +831,100 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             return
 
         print("[HOMOGENEITY-GUARD] satisfied")
+
+    def _enforce_privacy_risk(self, train_dataset, test_dataset, x_train, x_prepared_train, x_test,
+                              x_prepared_test, y_test, used_x_train, y_train):
+        """
+        Enforce privacy risk constraints using membership inference attacks on the generalized output.
+        The relative risk score comes from the attack framework.
+        For the membership classification attack it is the normalized ratio (member_auc / non_member_auc - 1). 
+        Absolute AUC caps prevent false-safe cases where the ratio looks acceptable but the release remains
+        distinguishable.
+        """
+        if self._privacy_risk_enforcer is None or not self._privacy_risk_enforcer.is_enabled():
+            return
+
+        nodes = self._get_nodes_level(self._level)
+        generalized_test = self._generalize(x_test, x_prepared_test, nodes)
+        generalized_train = self._generalize(x_train, x_prepared_train, nodes)
+        generalized_dataset = ArrayDataset(generalized_train, features_names=self._features)
+        metrics = self._privacy_risk_enforcer.evaluate(train_dataset, test_dataset, generalized_dataset)
+        print("\n[RISK] attack_type =", self._privacy_risk_enforcer.attack_type, " max_risk =", self._privacy_risk_enforcer.max_risk)
+        print("[RISK] risk_score=", metrics["risk_score"], " member_auc=", metrics["member_auc"],
+              " non_member_auc=", metrics["non_member_auc"], " warning=", metrics["warning"])
+
+        if self._privacy_risk_enforcer.check(metrics):
+            print("\n[RISK] Satisfied risk conditions")
+            return
+
+        self._privacy_risk_enforcer.on_violation(metrics)
+        if self._privacy_risk_enforcer.enforcement != "auto":
+            return
+
+        accuracy = self._calculate_accuracy(generalized_test, y_test, self.estimator, self.encoder)
+        ncp_value = self._compute_privacy_ncp(generalized_test)
+        best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
+        best_risk = metrics["risk_score"]
+        best_member_auc = metrics["member_auc"]
+        best_non_member_auc = metrics["non_member_auc"]
+        best_warning = metrics["warning"]
+        max_level = min(self.max_risk_prune_level, self._dt.get_depth())
+        iters = 0
+
+        if self._level >= max_level:
+            print("[RISK] Current level = ", self._level ,"is already >= max_level = ", max_level)
+            return
+
+        while (not self._privacy_risk_enforcer.check(metrics)) and self._level < max_level and iters < self._privacy_risk_enforcer.max_iters:
+
+            self._level += 1
+            iters += 1
+
+            nodes = self._get_nodes_level(self._level)
+            self._attach_cells_representatives(x_prepared_train, used_x_train, y_train, nodes)
+            generalized_test = self._generalize(x_test, x_prepared_test, nodes)
+            accuracy = self._calculate_accuracy(generalized_test, y_test, self.estimator, self.encoder)
+            min_allowed = self.target_accuracy - self.risk_accuracy_tolerance
+
+            if accuracy < min_allowed:
+                self._restore_state(best_state)
+                print("\n[RISK] stop: accuracy below tolerance, rolling back")
+                return
+
+            generalized_train = self._generalize(x_train, x_prepared_train, nodes)
+            generalized_dataset = ArrayDataset(generalized_train, features_names=self._features)
+            metrics = self._privacy_risk_enforcer.evaluate(train_dataset, test_dataset, generalized_dataset)
+
+            print("\n[RISK] level=", self._level, " accuracy=", accuracy, " risk_score=", metrics["risk_score"],
+                  " member_auc=", metrics["member_auc"], " non_member_auc=", metrics["non_member_auc"],
+                  " warning=", metrics["warning"])
+
+            metrics_warning_ok = (not self.risk_require_no_warning) or (not metrics["warning"])
+
+            member_auc_ok = self.risk_max_member_auc is None or metrics["member_auc"] is None or metrics["member_auc"] <= self.risk_max_member_auc
+            
+            non_member_auc_ok = self.risk_max_non_member_auc is None or metrics["non_member_auc"] is None or metrics["non_member_auc"] <= self.risk_max_non_member_auc
+
+            if metrics_warning_ok and member_auc_ok and non_member_auc_ok and metrics["risk_score"] < best_risk:
+                ncp_value = self._compute_privacy_ncp(generalized_test)
+                best_risk = metrics["risk_score"]
+                best_member_auc = metrics["member_auc"]
+                best_non_member_auc = metrics["non_member_auc"]
+                best_warning = metrics["warning"]
+                best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
+
+            if self._privacy_risk_enforcer.check(metrics):
+                print("\n[RISK] Satisfied risk conditions")
+                print("\n[RISK] satisfied level=", self._level, " risk_score=", metrics["risk_score"],
+                      " member_auc=", metrics["member_auc"], " non_member_auc=", metrics["non_member_auc"],
+                      " warning=", metrics["warning"])
+                return
+
+        if not self._privacy_risk_enforcer.check(metrics):
+            self._restore_state(best_state)
+            print("[RISK] stop: threshold not satisfied; best_risk=", best_risk,
+                  " best_member_auc=", best_member_auc, " best_non_member_auc=", best_non_member_auc,
+                  " best_warning=", best_warning, " rolling back")
     
     def _privatize_tree_thresholds(self, x_prepared: pd.DataFrame):
         """
@@ -1165,7 +1354,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
     def _calculate_level_cells(self, level):
         if level < 0 or level > self._dt.get_depth():
-            raise TypeError("Illegal level %d' % level", level)
+            raise TypeError("Illegal level")
 
         if level > 0:
             new_cells = []
@@ -1338,9 +1527,18 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 cell['representative'][feature] = row[feature]
 
     def _find_sample_nodes(self, samples, nodes):
+        # Always give sklearn a DataFrame with feature names (prevents warnings)
+        if not isinstance(samples, pd.DataFrame):
+            cols = getattr(self._dt, "feature_names_in_", None)
+            if cols is not None:
+                samples = pd.DataFrame(samples, columns=list(cols))
+            elif self._features is not None:
+                samples = pd.DataFrame(samples, columns=self._features)
+
         paths = self._dt.decision_path(samples).toarray()
-        nodeSet = set(nodes)
-        return [(list(set([i for i, v in enumerate(p) if v == 1]) & nodeSet))[0] for p in paths]
+        node_set = set(nodes)
+
+        return [(list(set([i for i, v in enumerate(p) if v == 1]) & node_set))[0] for p in paths]
 
     # method for applying generalizations (for global generalization-based acuuracy) without dt
     def _generalize_from_generalizations(self, original_data, generalizations):
