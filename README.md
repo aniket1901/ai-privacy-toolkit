@@ -29,14 +29,24 @@ This fork extends the **minimization** module with **four security features**: *
 
 `fit()` → encode categoricals → fit surrogate tree → **(DP)** `_privatize_tree_thresholds` → derive cells → `_attach_cells_representatives` (DP-safe representatives) → compute accuracy → **homogeneity guard** (`_enforce_homogeneity_guard`) → compute baseline NCP → **privacy floor** enforcement during pruning/feature-removal (snapshot/restore) → **risk-driven enforcement** (`_enforce_privacy_risk`) → final metrics stored in `self.ncp`. Each stage prints progress to the terminal (e.g., `[DP]`, `[PRIVACY-FLOOR]`, `[HOMOGENEITY-GUARD]`, `[RISK]`) for traceability and reproducibility.
 
-## Reproducible run
+## Installation and Run Instructions
+
+> **Python requirement:** Use **Python 3.11.x** (this project is tested on 3.11; newer versions may fail to build some pinned dependencies).
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
-pip install diffprivlib
+pytest -q tests/test_minimization_privacy_controls.py
 ```
+
+## Run the demo notebook
+
+After installing the package (steps above), launch Jupyter and run:
+
+- `notebooks/minimization_privacy_controls_adult.ipynb`
+
+This notebook reproduces the full pipeline on the Adult dataset and shows the effects of the 4 features.
 
 ## References
 
