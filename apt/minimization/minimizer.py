@@ -640,9 +640,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         if not self._privacy_floor_enforcer.check(ncp_value):
                             print("[PRIVACY-FLOOR] violated, rolling back to last safe state with NCP = ", best_state['ncp'])
                             self._privacy_floor_enforcer.on_violation(ncp_value)
+                            self._restore_state(best_state)
+                            break
 
                     if accuracy < self.target_accuracy:
-                        print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
                         print("Accuracy falling below target accuracy, restoring previous state")
                         self._restore_state(best_state)
                         break
@@ -879,6 +880,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             self._level += 1
             iters += 1
+
+            # try:
+            #     self._calculate_level_cells(self._level)
+            # except TypeError as e:
+            #     print(e)
+            #     self._restore_state(best_state)
+            #     print("[RISK] stop: cannot prune further, rolling back")
+            #     return
 
             nodes = self._get_nodes_level(self._level)
             self._attach_cells_representatives(x_prepared_train, used_x_train, y_train, nodes)
@@ -1388,6 +1397,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 self.cells = new_cells
                 self._cells_by_id = new_cells_by_id
             # else: nothing to do, stay with previous cells
+        if self.cells is not None:
+            self._cells_by_id = {cell['id']: cell for cell in self.cells}
 
     def _calculate_level_cell_label(self, left_cell, right_cell, new_cell):
         new_cell['hist'] = left_cell['hist'] + right_cell['hist']
@@ -1426,7 +1437,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     def _attach_cells_representatives(self, prepared_data, original_train_features, label_feature, level_nodes):
         # prepared data include one hot encoded categorical data,
         # if there is no categorical data prepared data is original data
-        nodeIds = self._find_sample_nodes(prepared_data, level_nodes)
+        nodeIds = self._find_sample_nodes(prepared_data, self._get_mappable_nodes(level_nodes, self._cells_by_id))
         for cell in self.cells:
             cell['representative'] = {}
             # get all rows in cell
@@ -1563,7 +1574,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         return original_data_generalized
 
     def _generalize_from_tree(self, original_data, prepared_data, level_nodes, cells, cells_by_id):
-        mapping_to_cells = self._map_to_cells(prepared_data, level_nodes, cells_by_id)
+        mapping_to_cells = self._map_to_cells(prepared_data, self._get_mappable_nodes(level_nodes, cells_by_id), cells_by_id)
         all_indexes = []
         for i in range(len(cells)):
             # get the indexes of all records that map to this cell
@@ -1651,8 +1662,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         return mapping_to_cells
 
     def _find_sample_cells(self, samples, nodes, cells_by_id):
-        node_ids = self._find_sample_nodes(samples, nodes)
+        node_ids = self._find_sample_nodes(samples, self._get_mappable_nodes(nodes, cells_by_id))
         return [cells_by_id[nodeId] for nodeId in node_ids]
+
+    @staticmethod
+    def _get_mappable_nodes(nodes, cells_by_id):
+        if cells_by_id:
+            return list(cells_by_id.keys())
+        return nodes
 
     def _remove_feature_from_generalization(self, original_data, prepared_data, nodes, labels, feature_data,
                                             current_accuracy, generalize_using_transform):
