@@ -5,7 +5,7 @@ This fork extends the **minimization** module with **four security features**: *
 ## New Security Features
 
 <p align="center">
-  <img src="docs/images/FeatureFlowchart.png?raw=true" width="467" title="Flowchart">
+  <img src="docs/images/FeatureFlowchart.png?raw=true" width="400" title="Flowchart">
 </p>
 <br />
 
