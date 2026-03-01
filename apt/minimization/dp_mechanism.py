@@ -1,10 +1,17 @@
+"""
+DifferentialPrivacy helper used by the minimizer.
+
+Wraps `diffprivlib` Laplace mechanisms to privatize scalar values (e.g., decision
+tree split thresholds). Supports optional truncation so noisy outputs stay within
+valid [lower, upper] bounds.
+"""
 from typing import Optional
 from diffprivlib.mechanisms import Laplace, LaplaceTruncated
 
 
 class DifferentialPrivacyMechanism:
     """
-    Simple laplace-mechanism implementing epsilon-differential privacy.
+    Laplace-mechanism wrapper for (epsilon, delta)-differential privacy.
     """
     def __init__(
         self, 
@@ -14,12 +21,16 @@ class DifferentialPrivacyMechanism:
         random_state: Optional[int] = None
     ):
         """
-        initialize laplace-based differential privacy mechanism
-
-        epsilon - privacy budget
-        sensitivity - global sensitivity of threshold function
-        delta - approximate DP parameter. For pure epsilon-DP keep it 0.0
-        random_state - optional random seed for reproducibility
+        :param epsilon: Privacy budget (> 0). Smaller epsilon = more noise = stronger privacy.
+        :type epsilon: float
+        :param sensitivity: Maximum amount the released scalar could change if one individual's record is added/removed
+                            (i.e., L1 global sensitivity). (> 0).
+        :type sensitivity: float, optional
+        :param delta: Probability that privacy loss can exceed ε. With delta=0, we get "pure" ε-DP.
+        :type delta: float, optional
+        :param random_state: Optional random seed for reproducible noise.
+        :type random_state: int, optional
+        :raises ValueError: If epsilon <= 0, sensitivity <= 0, or delta < 0.
         """
         if epsilon <= 0:
             raise ValueError('epsilon must be > 0')
@@ -33,18 +44,30 @@ class DifferentialPrivacyMechanism:
         self.delta = float(delta)
         self.random_state = random_state
 
-    def privatize_value(self, 
-                        value: float, 
-                        lower: Optional[float] = None,
-                        upper: Optional[float] = None, 
-                        sensitivity: Optional[float] = None) -> float:
+    def privatize_value(
+        self, 
+        value: float, 
+        lower: Optional[float] = None,
+        upper: Optional[float] = None, 
+        sensitivity: Optional[float] = None
+    ) -> float:
         """
-        privatize a numeric value with optional truncation bounds.
+        Privatize a numeric value with Laplace noise.
 
-        value - numeric value to privatize.
-        lower - optional lower truncation bound.
-        upper - optional upper truncation bound.
-        sensitivity - optional per-value sensitivity override.
+        If ``lower`` and ``upper`` are provided, uses a truncated Laplace mechanism so the
+        output stays within ``[lower, upper]``.
+
+        :param value: Numeric value to privatize.
+        :type value: float
+        :param lower: Optional lower bound for truncation (must be provided with ``upper``).
+        :type lower: float, optional
+        :param upper: Optional upper bound for truncation (must be provided with ``lower``).
+        :type upper: float, optional
+        :param sensitivity: Optional per-call sensitivity override (> 0).
+        :type sensitivity: float, optional
+        :return: Privatized (noisy) value.
+        :rtype: float
+        :raises ValueError: If sensitivity <= 0, only one bound is provided, or lower >= upper.
         """
         if sensitivity is not None:
             used_sensitivity = sensitivity 

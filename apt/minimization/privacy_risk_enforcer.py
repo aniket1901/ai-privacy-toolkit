@@ -1,5 +1,5 @@
 """
-Risk-driven privacy enforcement based on existing dataset membership inference attacks.
+Risk-driven privacy enforcement based on dataset membership inference attacks.
 """
 from typing import Optional
 
@@ -9,7 +9,7 @@ from apt.risk.data_assessment.dataset_attack_membership_knn_probabilities import
 
 class PrivacyRiskEnforcer:
     """
-    Wrapper around existing membership inference attacks for risk-driven privacy enforcement.
+    Wrapper around membership inference attacks used as a risk signal.
 
     For the membership classification attack, risk_score is the normalized ratio
     (member_auc / non_member_auc - 1). Absolute AUC caps prevent false-safe cases
@@ -26,6 +26,23 @@ class PrivacyRiskEnforcer:
         enforcement="auto",
         max_iters=10
     ):
+        '''
+        :param attack_type: Attack implementation used to compute risk.
+                       One of: "membership_classification", "membership_knn_probabilities".
+        :type attack_type: str, optional
+        :param max_risk: Maximum allowed `risk_score` (>= 0). If None, this check is disabled.
+        :type max_risk: float, optional
+        :param max_member_auc: Maximum allowed member AUC (0..1). If None, this check is disabled.
+        :type max_member_auc: float, optional
+        :param max_non_member_auc: Maximum allowed non-member AUC (0..1). If None, this check is disabled.
+        :type max_non_member_auc: float, optional
+        :param require_no_warning: If True, fail when the attack reports a data-quality warning.
+        :type require_no_warning: bool, optional
+        :param enforcement: "auto" or "raise". In "raise" mode, violations raise ValueError.
+        :type enforcement: str, optional
+        :param max_iters: Safety limit for iterative enforcement loops in the minimizer (>= 1).
+        :type max_iters: int, optional
+        '''
         if attack_type not in ("membership_classification", "membership_knn_probabilities"):
             raise ValueError("attack_type must be membership_classification or membership_knn_probabilities")
         if enforcement not in ("auto", "raise"):
@@ -47,12 +64,25 @@ class PrivacyRiskEnforcer:
         self.max_iters = max_iters
 
     def is_enabled(self):
+        ''' 
+        Return True if risk enforcement is active.
+        '''
         return self.max_risk is not None
 
     def evaluate(self, member_dataset, non_member_dataset, generalized_dataset) -> dict:
-        """
-        Run the configured membership attack and return its metrics.
-        """
+        '''
+        Run the configured membership attack and return standardized metrics.
+
+        :param member_dataset: Dataset representing members (training data).
+        :param non_member_dataset: Dataset representing non-members (holdout/test data).
+        :param generalized_dataset: Released dataset produced by minimization.
+        :return: Dict containing keys:
+                 - "risk_score" (float)
+                 - "member_auc" (float|None)
+                 - "non_member_auc" (float|None)
+                 - "warning" (bool)
+        :rtype: dict
+        '''
         if self.attack_type == "membership_classification":
             attack = DatasetAttackMembershipClassification(
                 member_dataset,
@@ -83,6 +113,9 @@ class PrivacyRiskEnforcer:
         }
 
     def check(self, metrics_dict):
+        '''
+        Return True if the provided metrics satisfy all configured thresholds.
+        '''
         if not self.is_enabled():
             return True
         if self.max_risk is not None and metrics_dict["risk_score"] > self.max_risk:
@@ -96,6 +129,9 @@ class PrivacyRiskEnforcer:
         return True
 
     def on_violation(self, metrics_dict):
+        '''
+        Handles a risk-policy violation based on enforcement mode
+        '''
         if not self.is_enabled():
             return
         if self.enforcement == "raise":
