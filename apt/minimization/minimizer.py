@@ -108,9 +108,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     :type homogeneity_accuracy_tolerance: float, optional
     :param risk_max_risk: Optional upper bound on the selected membership attack risk score.
     :type risk_max_risk: float, optional
-    :param risk_max_member_auc: Optional upper bound on member ROC AUC for membership classification attack.
+    :param risk_max_member_auc: Optional upper bound on member AUC for membership classification attack.
     :type risk_max_member_auc: float, optional
-    :param risk_max_non_member_auc: Optional upper bound on non-member ROC AUC for membership classification attack.
+    :param risk_max_non_member_auc: Optional upper bound on non-member AUC for membership classification attack.
     :type risk_max_non_member_auc: float, optional
     :param risk_require_no_warning: Whether the risk attack must not raise its synthetic data quality warning.
     :type risk_require_no_warning: bool, optional
@@ -545,7 +545,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             x_prepared = self._encode_categorical_features(used_x_train)
             self._dt.fit(x_prepared, y_train)
 
-            # Call privatize thresholds if diff priv is enabled
+            # Call privatize thresholds if DifferentialPrivacyMechanism is enabled
             if self._dp_mechanism:
                 print('Differential Privacy is enabled')
                 print("Epsilon: ", self.epsilon)
@@ -572,6 +572,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             print('\nInitial accuracy of model on generalized data, relative to original model predictions '
                   '(base generalization derived from tree, before improvements): %f' % accuracy)
             
+            # Call homogeneity guard if it is enabled
             if self._homogeneity_guard is not None and self._homogeneity_guard.is_enabled():
                 self._enforce_homogeneity_guard(
                     prepared_train=x_prepared,
@@ -592,7 +593,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 privacy_floor_enabled = self._privacy_floor_enforcer.is_enabled()
             initial_floor_violated = False
             ncp_value = 0.0
-
+            
+            # If privacy floor is enabled we first calculate the baseline and effective minimum NCP
             if privacy_floor_enabled:
                 self._baseline_ncp = self._compute_privacy_ncp(generalized)
                 self._privacy_floor_enforcer.set_baseline(self._baseline_ncp)
@@ -616,10 +618,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             if accuracy > self.target_accuracy:
                 print('\nImproving generalizations')
                 #self._level = 0
-                best_state = self._snapshot_state(accuracy, ncp_value)
+                best_state = self._snapshot_state(accuracy, ncp_value) # Save current state as best state seen so far
                 while accuracy > self.target_accuracy or (
                     privacy_floor_enabled and accuracy >= self.target_accuracy and not self._privacy_floor_enforcer.check(ncp_value)
-                ):
+                ): # Also added condition where we keep generalizing if min_NCP is not satisified yet
                     self._level += 1
                     nodes = self._get_nodes_level(self._level)
 
@@ -637,7 +639,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     if privacy_floor_enabled:
                         ncp_value = self._compute_privacy_ncp(generalized)
                         print("[PRIVACY-FLOOR] level=", self._level, " accuracy=", accuracy, " NCP=", ncp_value)
-                        if not self._privacy_floor_enforcer.check(ncp_value):
+                        # If NCP falls below min_ncp while generalizing, restore best state and break immediately
+                        if not self._privacy_floor_enforcer.check(ncp_value): 
                             print("[PRIVACY-FLOOR] violated, rolling back to last safe state with NCP = ", best_state['ncp'])
                             self._privacy_floor_enforcer.on_violation(ncp_value)
                             self._restore_state(best_state)
@@ -650,7 +653,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     else:
                         print('Pruned tree to level: %d, new relative accuracy: %f' % (self._level, accuracy))
                         if privacy_floor_enabled:
-                            if ncp_value >= best_state['ncp']:
+                            if ncp_value >= best_state['ncp']: # Save best state if NCP greater than current greatest NCP seen so far
                                 best_state = self._snapshot_state(accuracy, ncp_value)
                         else:
                             best_state = self._snapshot_state(accuracy, ncp_value)
@@ -665,6 +668,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                     if not initial_floor_violated:
                         best_safe = self._snapshot_state(accuracy, ncp_value)
                     else:
+                        # If privacy floor is enabled and the initial NCP was below min_ncp, we don't try to increase accuracy
                         print("[PRIVACY-FLOOR] initial state below min_ncp, stopping accuracy improvement")
                         stop_accuracy_improvement = True
 
@@ -688,6 +692,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                         if self._privacy_floor_enforcer.check(ncp_value):
                             best_safe = self._snapshot_state(accuracy, ncp_value)
                         else:
+                            # while improving accuracy, if at any point NCP falls to below min, we roll back to best previous state
                             self._privacy_floor_enforcer.on_violation(ncp_value)
                             print("[PRIVACY-FLOOR] violated, rolling back to last safe state with NCP = ", best_safe['ncp'])
                             self._restore_state(best_safe)
@@ -700,6 +705,8 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             # calculate iLoss
             train_dataset = ArrayDataset(x_train, features_names=self._features)
             test_dataset = ArrayDataset(x_test, features_names=self._features)
+
+            # Finally we enforce privacy risk by checking membership inference stats
             self._enforce_privacy_risk(
                 train_dataset=train_dataset,
                 test_dataset=test_dataset,
@@ -731,8 +738,10 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         # Return the transformer
         return self
 
-    # Helper functions to enforce min ncp
     def _snapshot_state(self, accuracy, ncp_value):
+        '''
+        Creates a snapshot of the current state with the following values
+        '''
         return {
             "cells": copy.deepcopy(self.cells),
             "generalizations": copy.deepcopy(self._generalizations),
@@ -744,6 +753,9 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         }
 
     def _restore_state(self, state):
+        '''
+        Helper used when we wanna restore an older state
+        '''
         self.cells = state["cells"]
         self._generalizations = state["generalizations"]
         self._cells_by_id = state["cells_by_id"]
@@ -751,11 +763,17 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         self._removed_count = state["removed_count"]
 
     def _compute_privacy_ncp(self, generalized):
+        '''
+        Helper used to correctly format data before calculating NCP
+        '''
         generalized_dataset = ArrayDataset(generalized, features_names=self._features)
         return self.calculate_ncp(generalized_dataset)
 
     def _collect_homogeneity_violations(self, prepared_train, y_train):
-
+        '''
+        Used to collect all cells where homogeneity constraints are violated.
+        Returns a list of cell IDs with their stats
+        '''
         level_nodes = self._get_nodes_level(self._level)
         node_ids = self._find_sample_nodes(prepared_train, level_nodes) # List of cells that each row falls in at this level
 
@@ -763,19 +781,24 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         for cell in self.cells:
             indices = [i for i, node_id in enumerate(node_ids) if node_id == cell['id']] # list of row ids that fall in this particular cell
             stats = self._homogeneity_guard.cell_stats(y_train, indices) 
-            if not self._homogeneity_guard.check_cell(stats):
+            if not self._homogeneity_guard.check_cell(stats): # If stats don't satisfy constraints, we add the cell to violations
                 violations.append((cell['id'], stats))
         return violations
 
     def _enforce_homogeneity_guard(self, prepared_train, y_train, x_test, x_prepared_test, y_test, x_prepared,
                                    used_x_train):
         """
-        Enforce homogeneity constraints on cells using y_train as the sensitive attribute.
-        If enforcement is "auto", prune to higher levels to merge cells while preserving target accuracy.
+        Enforce homogeneity constraints per cell using y_train as the sensitive attribute.
+
+        If violations exist:
+        - "warn"/"raise": report via HomogeneityGuard.on_violation().
+        - "auto": increase tree level (merge cells) until violations clear or utility drops
+            below (target_accuracy - homogeneity_accuracy_tolerance), roll back on failure.
         """
         violations = self._collect_homogeneity_violations(prepared_train, y_train)
         print("[HOMOGENEITY-GUARD] violations=", len(violations))
 
+        # Show all violations after they are collected
         for cell_id, stats in violations:
             print("[HOMOGENEITY-GUARD] cell_id=", cell_id, " size=", stats['size'], " distinct=", stats['distinct'],
                   " entropy=", stats['entropy'])
@@ -788,6 +811,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         if enforcement == "warn" or enforcement == "raise":
             self._homogeneity_guard.on_violation(violations[0][0], violations[0][1])
             return
+        
 
         nodes = self._get_nodes_level(self._level)
         generalized = self._generalize(x_test, x_prepared_test, nodes)
@@ -797,6 +821,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
         best_violation_count = len(violations)
         max_level = min(self.max_homogeneity_prune_level, self._dt.get_depth())
 
+        # Run loop until violations exist and until max level is reached
         while violations and self._level < max_level:
             self._level += 1
             try:
@@ -821,6 +846,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
 
             ncp_value = self._compute_privacy_ncp(generalized)
             violations = self._collect_homogeneity_violations(prepared_train, y_train)
+            # Save best state in case we have to rollback
             if len(violations) < best_violation_count:
                 best_violation_count = len(violations)
                 best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
@@ -881,20 +907,14 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             self._level += 1
             iters += 1
 
-            # try:
-            #     self._calculate_level_cells(self._level)
-            # except TypeError as e:
-            #     print(e)
-            #     self._restore_state(best_state)
-            #     print("[RISK] stop: cannot prune further, rolling back")
-            #     return
-
             nodes = self._get_nodes_level(self._level)
             self._attach_cells_representatives(x_prepared_train, used_x_train, y_train, nodes)
             generalized_test = self._generalize(x_test, x_prepared_test, nodes)
             accuracy = self._calculate_accuracy(generalized_test, y_test, self.estimator, self.encoder)
+            # Allow slight tolerance from target accuracy to see if risk can be reduced
             min_allowed = self.target_accuracy - self.risk_accuracy_tolerance
 
+            # If accuracy falls below allowed value at any time during the loop we restore best state and return
             if accuracy < min_allowed:
                 self._restore_state(best_state)
                 print("\n[RISK] stop: accuracy below tolerance, rolling back")
@@ -914,6 +934,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
             
             non_member_auc_ok = self.risk_max_non_member_auc is None or metrics["non_member_auc"] is None or metrics["non_member_auc"] <= self.risk_max_non_member_auc
 
+            # Store best state
             if metrics_warning_ok and member_auc_ok and non_member_auc_ok and metrics["risk_score"] < best_risk:
                 ncp_value = self._compute_privacy_ncp(generalized_test)
                 best_risk = metrics["risk_score"]
@@ -922,6 +943,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
                 best_warning = metrics["warning"]
                 best_state = self._snapshot_state(accuracy=accuracy, ncp_value=ncp_value)
 
+            # If conditions are satisfied, return with values
             if self._privacy_risk_enforcer.check(metrics):
                 print("\n[RISK] Satisfied risk conditions")
                 print("\n[RISK] satisfied level=", self._level, " risk_score=", metrics["risk_score"],
@@ -937,7 +959,7 @@ class GeneralizeToRepresentative(BaseEstimator, MetaEstimatorMixin, TransformerM
     
     def _privatize_tree_thresholds(self, x_prepared: pd.DataFrame):
         """
-        apply differential privacy to split thresholds of the surrogate tree in place.
+        Apply differential privacy to split thresholds of the surrogate tree in place.
 
         Laplace noise with truncation provides a formal DP mechanism for threshold release
         while keeping thresholds inside valid bounds. This reduces leakage risk and
