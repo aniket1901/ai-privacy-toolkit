@@ -50,7 +50,7 @@ In `auto` mode the minimizer searches over additional pruning levels (bounded by
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
-pytest -q tests/test_minimization_privacy_controls.py
+pytest -q tests/test_minimization_privacy_controls.py # To run unit tests on the mechanism wrappers
 ```
 
 ## Run the demo notebook
