@@ -3,6 +3,7 @@ import sklearn.preprocessing
 import pandas as pd
 import ssl
 from os import path, mkdir
+from os import makedirs
 from six.moves.urllib.request import urlretrieve
 
 
@@ -145,7 +146,7 @@ def get_adult_dataset_pd():
     test_file = 'datasets/adult/test'
 
     if not path.exists(data_dir):
-        mkdir(data_dir)
+        makedirs(data_dir, exist_ok=True)
 
     ssl._create_default_https_context = ssl._create_unverified_context
     if not path.exists(train_file):

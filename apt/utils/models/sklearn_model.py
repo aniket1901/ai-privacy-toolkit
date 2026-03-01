@@ -1,7 +1,7 @@
 from typing import Optional
 
 from sklearn.base import BaseEstimator
-
+import pandas as pd
 from apt.utils.models import Model, ModelOutputType, get_nb_classes
 from apt.utils.datasets import Dataset, ArrayDataset, OUTPUT_DATA_ARRAY_TYPE
 
@@ -22,7 +22,14 @@ class SklearnModel(Model):
         :type train_data: `Dataset`
         :return: the score as float (for classifiers, between 0 and 1)
         """
-        return self.model.score(test_data.get_samples(), test_data.get_labels(), **kwargs)
+        X = test_data.get_samples()
+        y = test_data.get_labels()
+
+        # If feature names exist, keep them so sklearn doesn't warn
+        if getattr(test_data, "features_names", None):
+            X = pd.DataFrame(X, columns=list(test_data.features_names))
+
+        return self.model.score(X, y, **kwargs)
 
 
 class SklearnClassifier(SklearnModel):
