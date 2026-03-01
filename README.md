@@ -1,50 +1,33 @@
-[![OpenSSF Best Practices](https://bestpractices.coreinfrastructure.org/projects/5836/badge)](https://bestpractices.coreinfrastructure.org/projects/5836)
+# ai-privacy-toolkit (extended minimization privacy controls)
 
-# ai-privacy-toolkit
-<p align="center">
-  <img src="docs/images/logo with text.jpg?raw=true" width="467" title="ai-privacy-toolkit logo">
-</p>
-<br />
+This fork extends the **minimization** module with **four security features**: **(1) Differential Privacy (DP)** at a concrete release point in the pipeline, **(2) a minimum NCP privacy floor** that prevents privacy from degrading during accuracy optimization, **(3) a homogeneity guard** to mitigate homogeneity/l-diversity failures at the cell level, and **(4) risk-driven enforcement** using membership-inference attacks already implemented in the toolkit. Together, these address a common gap in the state-of-the-art: many minimization/anonymization pipelines *measure* privacy (or report information-loss) but do not actively **enforce** privacy constraints once utility-driven optimization begins. The base toolkit is described in Goldsteen et al. (SoftwareX, 2023). DP follows the standard \((\varepsilon,\delta)\)-DP definition (Dwork et al., 2006), and homogeneity protection aligns with k-anonymity/l-diversity style failure modes (Machanavajjhala et al., 2007).
 
-A toolkit for tools and techniques related to the privacy and compliance of AI models.
+## New security features (code + purpose)
 
-The [**anonymization**](apt/anonymization/README.md) module contains methods for anonymizing ML model 
-training data, so that when a model is retrained on the anonymized data, the model itself will also be 
-considered anonymous. This may help exempt the model from different obligations and restrictions 
-set out in data protection regulations such as GDPR, CCPA, etc. 
+### 1) Differential Privacy (DP) for the surrogate tree release point
+- **Files:** `apt/minimization/dp_mechanism.py`, `apt/minimization/minimizer.py` (`_privatize_tree_thresholds`, DP-safe logic in `_attach_cells_representatives`)
+- **What it does:** After fitting the surrogate decision tree, we apply Laplace noise (via `diffprivlib`) to **non-leaf split thresholds** and use truncation bounds to keep noisy thresholds inside valid feature ranges. This reduces leakage from exact split points while keeping the tree usable. Since DP-noised thresholds may create empty regions, `_attach_cells_representatives` contains DP-safe fallback logic (relaxed matching + nearest-row selection) to ensure the pipeline remains stable and does not crash or leak outliers through failures.
 
-The [**minimization**](apt/minimization/README.md) module contains methods to help adhere to the data 
-minimization principle in GDPR for ML models. It enables to reduce the amount of 
-personal data needed to perform predictions with a machine learning model, while still enabling the model
-to make accurate predictions. This is done by by removing or generalizing some of the input features.
+### 2) Minimum NCP privacy floor (privacy “must not fall below X”)
+- **Files:** `apt/minimization/privacy_floor.py`, `apt/minimization/minimizer.py` (privacy-floor integration, snapshot/restore helpers)
+- **What it does:** We enforce a minimum privacy level using the toolkit’s NCP information-loss metric as an operational proxy. A baseline NCP is computed once, then an **effective floor** is enforced either as an absolute `min_ncp` or a relative floor `min_ncp = alpha * baseline_ncp`. During the “improve accuracy” loop (feature removal from constraints) and the “improve generalization” loop (tree pruning), the algorithm **snapshots state** and rolls back if the next step would reduce NCP below the floor.
 
-The [**dataset assessment**](apt/risk/data_assessment/README.md) module implements a tool for privacy assessment of
-synthetic datasets that are to be used in AI model training.
+### 3) Homogeneity guard (k / l-diversity / entropy per cell)
+- **Files:** `apt/minimization/homogeneity_guard.py`, `apt/minimization/minimizer.py` (`_collect_homogeneity_violations`, `_enforce_homogeneity_guard`)
+- **What it does:** Homogeneity attacks occur when a generalized group (“cell”) reveals sensitive outcomes because nearly everyone in the cell shares the same label. We compute per-cell label statistics (cell size, label diversity, entropy) and enforce constraints such as `min_cell_size`, `min_label_diversity`, and optional `min_entropy`. Enforcement modes are `warn`, `raise`, or `auto` (bounded pruning/merging of cells while respecting an accuracy tolerance).
 
-Official ai-privacy-toolkit documentation: https://ai-privacy-toolkit.readthedocs.io/en/latest/
+### 4) Risk-driven enforcement (membership inference attacks as a controller)
+- **Files:** `apt/minimization/privacy_risk_enforcer.py`, `apt/minimization/minimizer.py` (`_enforce_privacy_risk`), uses attacks in `apt/risk/data_assessment/*`
+- **What it does:** We turn the toolkit’s existing membership inference assessments into an **enforcement loop**. After producing a generalized dataset, we evaluate membership risk (classification- or KNN-based). We enforce thresholds on (a) `risk_score` (normalized ratio metric), (b) absolute member/non-member AUC caps, and (c) an explicit “no warning” quality gate. In `auto` mode the minimizer searches over additional pruning levels (bounded by `max_risk_prune_level` and `risk_accuracy_tolerance`) and rolls back to the best feasible state if constraints cannot be satisfied.
 
-Installation: pip install ai-privacy-toolkit
+## Execution flow (minimizer `fit()` call sequence)
 
-For more information or help using or improving the toolkit, please contact Abigail Goldsteen at abigailt@il.ibm.com, 
-or join our Slack channel: https://aip360.mybluemix.net/community.
+`fit()` → encode categoricals → fit surrogate tree → **(DP)** `_privatize_tree_thresholds` → derive cells → `_attach_cells_representatives` (DP-safe representatives) → compute accuracy → **homogeneity guard** (`_enforce_homogeneity_guard`) → compute baseline NCP → **privacy floor** enforcement during pruning/feature-removal (snapshot/restore) → **risk-driven enforcement** (`_enforce_privacy_risk`) → final metrics stored in `self.ncp`. Each stage prints progress to the terminal (e.g., `[DP]`, `[PRIVACY-FLOOR]`, `[HOMOGENEITY-GUARD]`, `[RISK]`) for traceability and reproducibility.
 
-We welcome new contributors! If you're interested, take a look at our [**contribution guidelines**](https://github.com/IBM/ai-privacy-toolkit/wiki/Contributing).
+## Reproducible run
 
-**Related toolkits:**
-
-ai-minimization-toolkit - has been migrated into this toolkit.
-
-[differential-privacy-library](https://github.com/IBM/differential-privacy-library): A 
-general-purpose library for experimenting with, investigating and developing applications in, 
-differential privacy.
-
-[adversarial-robustness-toolbox](https://github.com/Trusted-AI/adversarial-robustness-toolbox):
-A Python library for Machine Learning Security. Includes an attack module called *inference* that contains privacy attacks on ML models 
-(membership inference, attribute inference, model inversion and database reconstruction) as well as a *privacy* metrics module that contains
-membership leakage metrics for ML models.
-
-
-Citation
---------
-Abigail Goldsteen, Ola Saadi, Ron Shmelkin, Shlomit Shachor, Natalia Razinkov,
-"AI privacy toolkit", SoftwareX, Volume 22, 2023, 101352, ISSN 2352-7110, https://doi.org/10.1016/j.softx.2023.101352.
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+pip install diffprivlib
