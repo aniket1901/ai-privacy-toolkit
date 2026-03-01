@@ -2,7 +2,13 @@
 
 This fork extends the **minimization** module with **four security features**: **(1) Differential Privacy (DP)** at a concrete release point in the pipeline, **(2) a minimum NCP privacy floor** that prevents privacy from degrading during accuracy optimization, **(3) a homogeneity guard** to mitigate homogeneity/l-diversity failures at the cell level, and **(4) risk-driven enforcement** using membership-inference attacks already implemented in the toolkit. Together, these address a common gap in the state-of-the-art: many minimization/anonymization pipelines *measure* privacy (or report information-loss) but do not actively **enforce** privacy constraints once utility-driven optimization begins. The base toolkit is described in Goldsteen et al. (SoftwareX, 2023). DP follows the standard \((\varepsilon,\delta)\)-DP definition (Dwork et al., 2006), and homogeneity protection aligns with k-anonymity/l-diversity style failure modes (Machanavajjhala et al., 2007).
 
-## New security features (code + purpose)
+## New Security Features
+
+<p align="center">
+  <img src="docs/images/FeatureFlowchart.png?raw=true" width="467" title="Flowchart">
+</p>
+<br />
+
 
 ### 1) Differential Privacy (DP) for the surrogate tree release point
 - **Files:** `apt/minimization/dp_mechanism.py`, `apt/minimization/minimizer.py` (`_privatize_tree_thresholds`, DP-safe logic in `_attach_cells_representatives`)
