@@ -1,6 +1,6 @@
 # ai-privacy-toolkit (extended minimization privacy controls)
 
-This fork extends the **minimization** module with **four security features**: **(1) Differential Privacy (DP)** at a concrete release point in the pipeline, **(2) a minimum NCP privacy floor** that prevents privacy from degrading during accuracy optimization, **(3) a homogeneity guard** to mitigate homogeneity/l-diversity failures at the cell level, and **(4) risk-driven enforcement** using membership-inference attacks already implemented in the toolkit. Together, these address a common gap in the state-of-the-art: many minimization/anonymization pipelines *measure* privacy (or report information-loss) but do not actively **enforce** privacy constraints once utility-driven optimization begins. The base toolkit is described in Goldsteen et al. (SoftwareX, 2023). DP follows the standard \((\varepsilon,\delta)\)-DP definition (Dwork et al., 2006), and homogeneity protection aligns with k-anonymity/l-diversity style failure modes (Machanavajjhala et al., 2007).
+This fork adds **four privacy mechanisms** to the *minimization* module — DP threshold privatization, a minimum NCP privacy floor, a cell-level homogeneity guard, and a novel risk-driven enforcement via membership-inference attacks. These aim to address enforcement gaps discussed in Goldsteen paper’s broader privacy-assessment context by turning privacy metrics into privacy constraints during optimization.
 
 ## New Security Features
 
@@ -10,8 +10,8 @@ This fork extends the **minimization** module with **four security features**: *
 <br />
 
 ### 1) Differential Privacy (DP) for the surrogate tree release point
-- **Files:** `apt/minimization/dp_mechanism.py`, `apt/minimization/minimizer.py` (`_privatize_tree_thresholds`, DP-safe logic in `_attach_cells_representatives`)
-- **What it does:** After fitting the surrogate decision tree, we apply Laplace noise (via `diffprivlib`) to **non-leaf split thresholds** and use truncation bounds to keep noisy thresholds inside valid feature ranges. This reduces leakage from exact split points while keeping the tree usable. Since DP-noised thresholds may create empty regions, `_attach_cells_representatives` contains DP-safe fallback logic (relaxed matching + nearest-row selection) to ensure the pipeline remains stable and does not crash or leak outliers through failures.
+- **Files:** `apt/minimization/dp_mechanism.py`, `apt/minimization/minimizer.py` (`_privatize_tree_thresholds`, DP-SAFEGUARD logic in `_attach_cells_representatives`)
+- **What it does:** After fitting the surrogate decision tree, we apply Laplace noise (via `diffprivlib`) to **non-leaf split thresholds** and use truncation bounds to keep noisy thresholds inside valid feature ranges. This reduces leakage from exact split points while keeping the tree usable. Since DP-noised thresholds may create empty regions, `_attach_cells_representatives` contains DP-safe fallback logic (relaxed matching + nearest-row selection) to ensure the pipeline remains stable and does not crash or create outliers through failures.
 
 ### 2) Minimum NCP privacy floor (privacy “must not fall below X”)
 - **Files:** `apt/minimization/privacy_floor.py`, `apt/minimization/minimizer.py` (privacy-floor integration, snapshot/restore helpers)
@@ -25,13 +25,24 @@ This fork extends the **minimization** module with **four security features**: *
 - **Files:** `apt/minimization/privacy_risk_enforcer.py`, `apt/minimization/minimizer.py` (`_enforce_privacy_risk`), uses attacks in `apt/risk/data_assessment/*`
 - **What it does:** We turn the toolkit’s existing membership inference assessments into an **enforcement loop**. After producing a generalized dataset, we evaluate membership risk (classification- or KNN-based). We enforce thresholds on (a) `risk_score` (normalized ratio metric), (b) absolute member/non-member AUC caps, and (c) an explicit “no warning” quality gate. In `auto` mode the minimizer searches over additional pruning levels (bounded by `max_risk_prune_level` and `risk_accuracy_tolerance`) and rolls back to the best feasible state if constraints cannot be satisfied.
 
-## Execution flow (minimizer `fit()` call sequence)
+## Execution Flow (minimizer `fit()` call sequence)
 
-`fit()` → encode categoricals → fit surrogate tree → **(DP)** `_privatize_tree_thresholds` → derive cells → `_attach_cells_representatives` (DP-safe representatives) → compute accuracy → **homogeneity guard** (`_enforce_homogeneity_guard`) → compute baseline NCP → **privacy floor** enforcement during pruning/feature-removal (snapshot/restore) → **risk-driven enforcement** (`_enforce_privacy_risk`) → final metrics stored in `self.ncp`. Each stage prints progress to the terminal (e.g., `[DP]`, `[PRIVACY-FLOOR]`, `[HOMOGENEITY-GUARD]`, `[RISK]`) for traceability and reproducibility.
+- Build surrogate decision tree
+- **DifferentialPrivacy:** privatize thresholds (`_privatize_tree_thresholds`)
+- Build/modify cells (`_calculate_cells` → `_modify_cells`)
+- Attach cell representatives (**DP-SAFEGUARD** fallback) (`_attach_cells_representatives`)
+- **Homogeneity guard:** detect/enforce cell label diversity (`_enforce_homogeneity_guard`)
+- **Privacy floor (NCP):** compute baseline NCP and enforce min NCP while:
+  - improving generalization (`_calculate_level_cells` loop) or
+  - improving accuracy (`_remove_feature_from_generalization` loop)
+  - using snapshot/restore (`_snapshot_state` / `_restore_state`)
+- **Risk-driven enforcement:** run membership-inference attack and enforce thresholds (`_enforce_privacy_risk`)
+- Store final scores (`self.ncp.fit_score`, `self.ncp.generalizations_score`)
+- Logs printed throughout for traceability: `[DP]`, `[DP-SAFEGUARD]`, `[HOMOGENEITY-GUARD]`, `[PRIVACY-FLOOR]`, `[RISK]`
 
 ## Installation and Run Instructions
 
-> **Python requirement:** Use **Python 3.11.x** (this project is tested on 3.11; newer versions may fail to build some pinned dependencies).
+> **Python requirement:** Use **Python 3.11.x** (this project is tested on 3.11; newer versions may fail to build some dependencies).
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
@@ -50,6 +61,8 @@ This notebook reproduces the full pipeline on the Adult dataset and shows the ef
 
 ## References
 
-1. Goldsteen, A., et al. Data minimization for GDPR compliance in machine learning models. *AI and Ethics*, 2021.
-2. Machanavajjhala, A., et al. l-diversity: Privacy beyond k-anonymity. *TKDD*, 2007.]
-3. Dwork, C., et al. Calibrating noise to sensitivity in private data analysis. *TCC*, 2006.
+* Goldsteen, A., et al. Data minimization for GDPR compliance in machine learning models. *AI and Ethics*, 2021.
+* Holohan, N., Antonatos, S., Braghin, S. and Mac Aonghusa, P., 2018. [The Bounded Laplace Mechanism in Differential privacy](https://doi.org/10.29012/jpc.715). *Journal of Privacy and Confidentiality 10 (1).*
+* Holohan, N., Braghin, S., Mac Aonghusa, P. and Levacher, K., 2019. [Diffprivlib: the IBM Differential Privacy Library](https://arxiv.org/abs/1907.02444). *ArXiv e-prints 1907.02444 [cs.CR].*
+* Machanavajjhala, A., et al. l-diversity: Privacy beyond k-anonymity. *TKDD*, 2007.
+* Dwork, C., et al. Calibrating noise to sensitivity in private data analysis. *TCC*, 2006.
