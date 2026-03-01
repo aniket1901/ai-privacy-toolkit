@@ -9,7 +9,6 @@ This fork extends the **minimization** module with **four security features**: *
 </p>
 <br />
 
-
 ### 1) Differential Privacy (DP) for the surrogate tree release point
 - **Files:** `apt/minimization/dp_mechanism.py`, `apt/minimization/minimizer.py` (`_privatize_tree_thresholds`, DP-safe logic in `_attach_cells_representatives`)
 - **What it does:** After fitting the surrogate decision tree, we apply Laplace noise (via `diffprivlib`) to **non-leaf split thresholds** and use truncation bounds to keep noisy thresholds inside valid feature ranges. This reduces leakage from exact split points while keeping the tree usable. Since DP-noised thresholds may create empty regions, `_attach_cells_representatives` contains DP-safe fallback logic (relaxed matching + nearest-row selection) to ensure the pipeline remains stable and does not crash or leak outliers through failures.
@@ -37,3 +36,10 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .
 pip install diffprivlib
+```
+
+## References
+
+1. Goldsteen, A., et al. Data minimization for GDPR compliance in machine learning models. *AI and Ethics*, 2021.
+2. Machanavajjhala, A., et al. l-diversity: Privacy beyond k-anonymity. *TKDD*, 2007.]
+3. Dwork, C., et al. Calibrating noise to sensitivity in private data analysis. *TCC*, 2006.
